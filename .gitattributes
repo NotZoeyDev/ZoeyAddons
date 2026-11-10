@@ -1,0 +1,7 @@
+# LF everywhere, so a checkout on the release runner hashes the same bytes on every machine.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.psd binary
+*.fbx binary
+*.unitypackage binary
