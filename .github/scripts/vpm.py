@@ -2,8 +2,8 @@
 """Publish the packages under Packages/ as a VPM (VCC / ALCOM) listing.
 
   vpm.py release            GitHub release for every Packages/<name> whose version has none yet
-  vpm.py listing --out DIR  DIR/index.json (the VPM listing), DIR/index.html and DIR/<name>/CHANGELOG.md,
-                            from all releases
+  vpm.py listing --out DIR  DIR/index.json (the VPM listing), DIR/index.html, and per package
+                            DIR/<name>/CHANGELOG.md plus its rendered DIR/<name>/index.html, from all releases
 
 Runs in GitHub Actions with GH_TOKEN and GITHUB_REPOSITORY set, through the runner's `gh` CLI, in a checkout
 with full history and every release tag. Each release carries the package zip plus a `package.json` asset that
@@ -11,8 +11,8 @@ is the exact listing entry (manifest + url + zipSHA256), so building the listing
 
 Changelogs come from commit messages: a version lists the commits touching Packages/<name>/ since the
 previous released version, with a leading "<displayName> [<version>]:" dropped from the subject. That list
-is the version's release notes, and every listing entry gets a `changelogUrl` to the package's CHANGELOG.md
-unless its package.json sets one.
+is the version's release notes, and every listing entry gets a `changelogUrl` to the package's rendered
+changelog page (DIR/<name>/, rendered through GitHub's markdown API) unless its package.json sets one.
 """
 import argparse
 import hashlib
@@ -34,8 +34,8 @@ CONFIG = ROOT / "listing.json"
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)
 
 
-def gh(*args, check=True):
-    return subprocess.run(["gh", *args], check=check, text=True, capture_output=True)
+def gh(*args, check=True, input=None):
+    return subprocess.run(["gh", *args], check=check, text=True, encoding="utf-8", capture_output=True, input=input)
 
 
 def git(*args):
@@ -218,15 +218,56 @@ def cmd_listing(args):
     base = listing["url"].rsplit("/", 1)[0]
     for name, package in listing["packages"].items():
         (out / name).mkdir(parents=True, exist_ok=True)
-        (out / name / "CHANGELOG.md").write_text(changelog(package["versions"]), encoding="utf-8")
+        markdown = changelog(package["versions"])
+        (out / name / "CHANGELOG.md").write_text(markdown, encoding="utf-8")
+        (out / name / "index.html").write_text(render_changelog(package["versions"], markdown), encoding="utf-8")
         for entry in package["versions"].values():
-            entry.setdefault("changelogUrl", f"{base}/{quote(name)}/CHANGELOG.md")
+            entry.setdefault("changelogUrl", f"{base}/{quote(name)}/")
 
     out.mkdir(parents=True, exist_ok=True)
     (out / "index.json").write_text(json.dumps(listing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (out / "index.html").write_text(render_page(listing), encoding="utf-8")
     print(f"Listed {sum(len(p['versions']) for p in listing['packages'].values())} versions "
           f"of {len(listing['packages'])} packages at {listing['url']}")
+
+
+STYLE = """
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #e6e6e6; background: #1b1b1f; line-height: 1.5; }
+  a { color: #8ab4ff; }
+  .add { display: inline-block; padding: .6rem 1.1rem; border-radius: 6px; background: #3b6ef5; color: #fff; text-decoration: none; font-weight: 600; }
+  code { background: #2a2a31; padding: .1rem .35rem; border-radius: 4px; }
+  pre { background: #2a2a31; padding: .8rem; border-radius: 6px; overflow-x: auto; }
+  pre code { padding: 0; }
+  h2 { margin-top: 2rem; padding-bottom: .3rem; border-bottom: 1px solid #33333b; }
+  li + li { margin-top: .5rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
+  th, td { text-align: left; vertical-align: top; padding: .6rem; border-bottom: 1px solid #33333b; }
+"""
+
+
+def page(title, body):
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>{STYLE}</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def render_changelog(versions, markdown):
+    """HTML page of a package's CHANGELOG.md, rendered (and sanitized) by GitHub's markdown API."""
+    latest = versions[max(versions, key=version_key)]
+    rendered = gh("api", "markdown", "--input", "-",
+                  input=json.dumps({"text": markdown, "mode": "gfm", "context": repository()})).stdout
+    nav = '<p><a href="../">← All packages</a> · <a href="CHANGELOG.md">Markdown</a></p>'
+    return page(f"{html.escape(latest['displayName'])} changelog", f"{nav}\n{rendered}")
 
 
 def render_page(listing):
@@ -247,23 +288,7 @@ def render_page(listing):
             "</tr>")
     body = "\n".join(rows) or "<tr><td colspan=\"3\">No packages released yet.</td></tr>"
     title = html.escape(listing["name"])
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #e6e6e6; background: #1b1b1f; }}
-  a {{ color: #8ab4ff; }}
-  .add {{ display: inline-block; padding: .6rem 1.1rem; border-radius: 6px; background: #3b6ef5; color: #fff; text-decoration: none; font-weight: 600; }}
-  code {{ background: #2a2a31; padding: .1rem .35rem; border-radius: 4px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 1.5rem; }}
-  th, td {{ text-align: left; vertical-align: top; padding: .6rem; border-bottom: 1px solid #33333b; }}
-</style>
-</head>
-<body>
-<h1>{title}</h1>
+    return page(title, f"""<h1>{title}</h1>
 <p><a class="add" href="vcc://vpm/addRepo?url={quote(url, safe='')}">Add to VCC / ALCOM</a></p>
 <p>Or add this repository URL by hand: <code>{html.escape(url)}</code></p>
 <table>
@@ -271,10 +296,7 @@ def render_page(listing):
 <tbody>
 {body}
 </tbody>
-</table>
-</body>
-</html>
-"""
+</table>""")
 
 
 def main():
