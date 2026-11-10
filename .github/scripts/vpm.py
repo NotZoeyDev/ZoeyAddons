@@ -2,20 +2,28 @@
 """Publish the packages under Packages/ as a VPM (VCC / ALCOM) listing.
 
   vpm.py release            GitHub release for every Packages/<name> whose version has none yet
-  vpm.py listing --out DIR  DIR/index.json (the VPM listing) and DIR/index.html, from all releases
+  vpm.py listing --out DIR  DIR/index.json (the VPM listing), DIR/index.html and DIR/<name>/CHANGELOG.md,
+                            from all releases
 
-Runs in GitHub Actions with GH_TOKEN and GITHUB_REPOSITORY set, through the runner's `gh` CLI.
-Each release carries the package zip plus a `package.json` asset that is the exact listing entry
-(manifest + url + zipSHA256), so building the listing never re-downloads zips.
+Runs in GitHub Actions with GH_TOKEN and GITHUB_REPOSITORY set, through the runner's `gh` CLI, in a checkout
+with full history and every release tag. Each release carries the package zip plus a `package.json` asset that
+is the exact listing entry (manifest + url + zipSHA256), so building the listing never re-downloads zips.
+
+Changelogs come from commit messages: a version lists the commits touching Packages/<name>/ since the
+previous released version, with a leading "<displayName> [<version>]:" dropped from the subject. That list
+is the version's release notes, and every listing entry gets a `changelogUrl` to the package's CHANGELOG.md
+unless its package.json sets one.
 """
 import argparse
 import hashlib
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -30,12 +38,71 @@ def gh(*args, check=True):
     return subprocess.run(["gh", *args], check=check, text=True, capture_output=True)
 
 
+def git(*args):
+    return subprocess.run(["git", "-C", str(ROOT), *args],
+                          check=True, text=True, encoding="utf-8", capture_output=True).stdout
+
+
+def commit_of(ref):
+    """Commit hash of ref, or None when the checkout does not have it."""
+    result = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                            text=True, capture_output=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def release_tags():
+    return [release["tagName"] for release in
+            json.loads(gh("release", "list", "--limit", "1000", "--json", "tagName").stdout)]
+
+
 def repository():
     return os.environ["GITHUB_REPOSITORY"]
 
 
 def tag_for(manifest):
     return f"{manifest['name']}-v{manifest['version']}"
+
+
+def previous_release(manifest, tags):
+    """Tag of the highest released version below manifest's, or None for a package's first release."""
+    prefix = f"{manifest['name']}-v"
+    older = [tag[len(prefix):] for tag in tags
+             if tag.startswith(prefix) and version_key(tag[len(prefix):]) < version_key(manifest["version"])]
+    return f"{prefix}{max(older, key=version_key)}" if older else None
+
+
+def changes(manifest, end, start):
+    """Markdown list of the commits in start..end (all of end's history when start is None) touching the package."""
+    log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e",
+              f"{start}..{end}" if start else end, "--", f"Packages/{manifest['name']}")
+    prefix = re.compile(rf"^{re.escape(manifest['displayName'])}(\s+v?\d[\w.+-]*)?\s*:\s*", re.IGNORECASE)
+    items = []
+    for record in filter(None, (record.strip() for record in log.split("\x1e"))):
+        sha, subject, body = record.split("\x1f")
+        subject = prefix.sub("", subject.strip(), count=1)
+        item = f"- {subject[:1].upper()}{subject[1:]} ([`{sha[:7]}`](https://github.com/{repository()}/commit/{sha}))"
+        if body.strip():
+            item += "\n\n" + textwrap.indent(body.strip(), "  ")
+        items.append(item)
+    return "\n\n".join(items)
+
+
+def changelog(versions):
+    """CHANGELOG.md of one package, newest version first, from its listing entries (version -> entry)."""
+    sections = []
+    previous = None
+    for version in sorted(versions, key=version_key):
+        tag = tag_for(versions[version])
+        commit = commit_of(tag)
+        if commit is None:
+            print(f"::warning::tag {tag} is not in the checkout; {version} is left out of the changelog.")
+            continue
+        notes = changes(versions[version], commit, previous) or "No commits touched the package."
+        date = git("log", "-1", "--format=%cs", commit).strip()
+        sections.append(f"## {version} ({date})\n\n{notes}\n")
+        previous = commit
+    latest = versions[max(versions, key=version_key)]
+    return f"# {latest['displayName']} changelog\n\n" + "\n".join(reversed(sections))
 
 
 def local_packages():
@@ -81,6 +148,7 @@ def download(tag, pattern, directory):
 def cmd_release(_args):
     commit = os.environ["GITHUB_SHA"]
     dist = ROOT / "dist"
+    tags = release_tags()
     for package_dir, manifest in local_packages():
         tag = tag_for(manifest)
         files = package_files(package_dir)
@@ -109,10 +177,14 @@ def cmd_release(_args):
         entry_path = out / "package.json"
         entry_path.write_text(json.dumps(entry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+        previous = previous_release(manifest, tags)
+        start = commit_of(previous) if previous else None
+        if previous and start is None:
+            print(f"::warning::tag {previous} is not in the checkout; {tag} notes cover the whole history.")
         gh("release", "create", tag, str(zip_path), str(entry_path),
            "--target", commit,
            "--title", f"{manifest['displayName']} {manifest['version']}",
-           "--notes", manifest.get("description", ""))
+           "--notes", changes(manifest, commit, start) or manifest.get("description", ""))
         print(f"Released {tag}")
 
 
@@ -133,9 +205,7 @@ def cmd_listing(args):
         "packages": {},
     }
 
-    releases = json.loads(gh("release", "list", "--limit", "1000", "--json", "tagName").stdout)
-    for release in releases:
-        tag = release["tagName"]
+    for tag in release_tags():
         with tempfile.TemporaryDirectory() as tmp:
             entry_path = download(tag, "package.json", tmp)
             entry = json.loads(entry_path.read_text(encoding="utf-8")) if entry_path else None
@@ -145,6 +215,13 @@ def cmd_listing(args):
         listing["packages"].setdefault(entry["name"], {"versions": {}})["versions"][entry["version"]] = entry
 
     out = Path(args.out)
+    base = listing["url"].rsplit("/", 1)[0]
+    for name, package in listing["packages"].items():
+        (out / name).mkdir(parents=True, exist_ok=True)
+        (out / name / "CHANGELOG.md").write_text(changelog(package["versions"]), encoding="utf-8")
+        for entry in package["versions"].values():
+            entry.setdefault("changelogUrl", f"{base}/{quote(name)}/CHANGELOG.md")
+
     out.mkdir(parents=True, exist_ok=True)
     (out / "index.json").write_text(json.dumps(listing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (out / "index.html").write_text(render_page(listing), encoding="utf-8")
@@ -158,12 +235,15 @@ def render_page(listing):
     for name, package in sorted(listing["packages"].items()):
         versions = sorted(package["versions"], key=version_key, reverse=True)
         latest = package["versions"][versions[0]]
+        changelog_link = (f"<br><a href=\"{html.escape(latest['changelogUrl'])}\">Changelog</a>"
+                          if latest.get("changelogUrl") else "")
         rows.append(
             "<tr>"
             f"<td><strong>{html.escape(latest.get('displayName', name))}</strong><br><code>{html.escape(name)}</code></td>"
             f"<td>{html.escape(latest.get('description', ''))}</td>"
             f"<td><a href=\"{html.escape(latest['url'])}\">{html.escape(versions[0])}</a>"
-            f"{f'<br><small>{len(versions)} versions</small>' if len(versions) > 1 else ''}</td>"
+            f"{f'<br><small>{len(versions)} versions</small>' if len(versions) > 1 else ''}"
+            f"{changelog_link}</td>"
             "</tr>")
     body = "\n".join(rows) or "<tr><td colspan=\"3\">No packages released yet.</td></tr>"
     title = html.escape(listing["name"])
