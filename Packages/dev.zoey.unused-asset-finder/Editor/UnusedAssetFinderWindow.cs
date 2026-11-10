@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -215,6 +216,9 @@ namespace UnusedAssetFinder
             footer.Add(new Button(() => SetMarked(list.selectedItems.OfType<UnusedAsset>(), true)) { text = "Mark highlighted", tooltip = "Mark the rows highlighted with click / Shift-click / Ctrl-click." });
             keepButton = new Button(ToggleKeepMarked);
             footer.Add(keepButton);
+            var deleteFolders = new Toggle("Delete emptied folders") { value = Settings.DeleteEmptiedFolders, tooltip = "After deleting, also move folders to the trash that the deletion left with no files or subfolders at all." };
+            deleteFolders.RegisterValueChangedCallback(evt => { Settings.DeleteEmptiedFolders = evt.newValue; Settings.Persist(); });
+            footer.Add(deleteFolders);
             footer.Add(new Button(DeleteMarked) { text = "Delete marked…", tooltip = "Move the marked assets to the system trash." });
             return footer;
         }
@@ -447,8 +451,9 @@ namespace UnusedAssetFinder
             string preview = string.Join("\n", assets.Take(PreviewLines).Select(a => a.Path));
             if (assets.Count > PreviewLines) preview += $"\n… and {assets.Count - PreviewLines} more";
             string size = EditorUtility.FormatBytes(assets.Sum(a => a.SizeBytes));
+            string folderNote = Settings.DeleteEmptiedFolders ? "\n\nFolders left completely empty are moved to the trash too." : "";
             if (!EditorUtility.DisplayDialog("Delete unused assets",
-                    $"Move {assets.Count} assets ({size}) to the system trash?\n\n{preview}", "Move to Trash", "Cancel"))
+                    $"Move {assets.Count} assets ({size}) to the system trash?{folderNote}\n\n{preview}", "Move to Trash", "Cancel"))
                 return;
 
             var failed = new List<string>();
@@ -465,8 +470,38 @@ namespace UnusedAssetFinder
                 settings.KeptGuids.Remove(asset.Guid);
             }
             settings.Persist();
+            if (settings.DeleteEmptiedFolders)
+                TrashEmptiedFolders(assets.Select(a => a.Path).Where(path => !failedSet.Contains(path)));
             marked.Clear();
             ApplyFilter();
+        }
+
+        // Trashes the folders of the deleted assets, and their ancestors below Assets/, that have nothing left
+        // on disk: no files (hidden ones and stray .meta included) and no subfolders. Deepest first, so a parent
+        // holding only folders this pass emptied is judged after they are gone.
+        private static void TrashEmptiedFolders(IEnumerable<string> deletedPaths)
+        {
+            var candidates = new HashSet<string>();
+            foreach (string path in deletedPaths)
+            {
+                for (string folder = ParentFolder(path); folder != null && folder != "Assets"; folder = ParentFolder(folder))
+                    if (!candidates.Add(folder)) break;
+            }
+
+            var trashed = new List<string>();
+            foreach (string folder in candidates.OrderByDescending(f => f.Count(c => c == '/')))
+            {
+                if (!AssetDatabase.IsValidFolder(folder) || Directory.EnumerateFileSystemEntries(folder).Any()) continue;
+                if (AssetDatabase.MoveAssetToTrash(folder)) trashed.Add(folder);
+                else Debug.LogWarning($"[Unused Asset Finder] Could not move emptied folder to trash: {folder}");
+            }
+            if (trashed.Count > 0) Debug.Log($"[Unused Asset Finder] Moved {trashed.Count} emptied folder(s) to trash:\n" + string.Join("\n", trashed));
+        }
+
+        private static string ParentFolder(string path)
+        {
+            int slash = path.LastIndexOf('/');
+            return slash > 0 ? path.Substring(0, slash) : null;
         }
 
         private void RebuildSceneToggles()

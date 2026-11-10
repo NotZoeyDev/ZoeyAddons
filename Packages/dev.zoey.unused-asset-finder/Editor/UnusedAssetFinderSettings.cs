@@ -14,6 +14,7 @@ namespace UnusedAssetFinder
         public bool PrefabsAreRoots;
         public bool ScriptableAssetsAreRoots = true;
         public string ExtraProtectedPaths = "";
+        public bool DeleteEmptiedFolders = true;
 
         public List<string> ExtraProtectedPathList =>
             ExtraProtectedPaths.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
