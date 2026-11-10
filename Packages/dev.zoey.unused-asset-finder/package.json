@@ -3,7 +3,7 @@
   "displayName": "Unused Asset Finder",
   "version": "1.0.1",
   "unity": "2022.3",
-  "description": "Lists materials and textures under Assets/ that no chosen scene uses, with sizes, keep/delete controls, and shader packages (Poiyomi, lilToon and other common VRChat shaders), Unity special folders and script-referenced assets protected. Window: Tools/Unused Asset Finder.",
+  "description": "Finds materials and textures under Assets/ that aren't used in any of the chosen scenes. Found under the Tools tab.",
   "author": {
     "name": "Zoey"
   }
